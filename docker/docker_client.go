@@ -34,6 +34,8 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -1041,7 +1043,9 @@ func (c *dockerClient) getBlob(ctx context.Context, ref dockerReference, info ty
 		res.Body.Close()
 		return nil, 0, fmt.Errorf("fetching blob: %w", err)
 	}
+	ctx, childSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "dockerClient getBlob RecordKnownLocation", trace.WithAttributes(attribute.String("digest", string(info.Digest))))
 	cache.RecordKnownLocation(ref.Transport(), bicTransportScope(ref), info.Digest, newBICLocationReference(ref))
+	childSpan.End()
 	blobSize := getBlobSize(res)
 
 	reconnectingReader, err := newBodyReader(ctx, c, path, res.Body)

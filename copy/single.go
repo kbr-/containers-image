@@ -27,6 +27,7 @@ import (
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/vbauerster/mpb/v8"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // imageCopier tracks state specific to a single image (possibly an item of a manifest list)
@@ -428,6 +429,9 @@ func (ic *imageCopier) compareImageDestinationManifestEqual(ctx context.Context,
 
 // copyLayers copies layers from ic.src/ic.c.rawSource to dest, using and updating ic.manifestUpdates if necessary and ic.cannotModifyManifestReason == "".
 func (ic *imageCopier) copyLayers(ctx context.Context) ([]compressiontypes.Algorithm, error) {
+	ctx, childSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "copyLayers")
+	defer childSpan.End()
+
 	srcInfos := ic.src.LayerInfos()
 	updatedSrcInfos, err := ic.src.LayerInfosForCopy(ctx)
 	if err != nil {
