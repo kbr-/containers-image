@@ -35,6 +35,8 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -209,7 +211,9 @@ func (s *storageImageDestination) computeNextBlobCacheFile() string {
 // to any other readers for download using the supplied digest.
 // If stream.Read() at any time, ESPECIALLY at end of input, returns an error, PutBlob MUST 1) fail, and 2) delete any data stored so far.
 func (s *storageImageDestination) PutBlobWithOptions(ctx context.Context, stream io.Reader, blobinfo types.BlobInfo, options private.PutBlobOptions) (private.UploadedBlob, error) {
+	_, childSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "PutBlobWithOptions putBlobToPendingFile", trace.WithAttributes(attribute.String("digest", string(blobinfo.Digest))))
 	info, err := s.putBlobToPendingFile(stream, blobinfo, &options)
+	childSpan.End()
 	if err != nil {
 		return info, err
 	}
@@ -217,6 +221,9 @@ func (s *storageImageDestination) PutBlobWithOptions(ctx context.Context, stream
 	if options.IsConfig || options.LayerIndex == nil {
 		return info, nil
 	}
+
+	_, childSpan = trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "PutBlobWithOptions queueOrCommit", trace.WithAttributes(attribute.String("digest", string(info.Digest)), attribute.Int("layerIndex", *options.LayerIndex)))
+	defer childSpan.End()
 
 	return info, s.queueOrCommit(*options.LayerIndex, addedLayerInfo{
 		digest:     info.Digest,
@@ -401,6 +408,9 @@ func (s *storageImageDestination) TryReusingBlobWithOptions(ctx context.Context,
 	if err != nil || !reused || options.LayerIndex == nil {
 		return reused, info, err
 	}
+
+	_, childSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "TryReusingBlobWithOptions queueOrCommit", trace.WithAttributes(attribute.String("digest", string(info.Digest))))
+	defer childSpan.End()
 
 	return reused, info, s.queueOrCommit(*options.LayerIndex, addedLayerInfo{
 		digest:     info.Digest,
