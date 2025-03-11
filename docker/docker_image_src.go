@@ -388,6 +388,7 @@ func (s *dockerImageSource) GetBlobAt(ctx context.Context, info types.BlobInfo, 
 
 	rangeVals := make([]string, 0, len(chunks))
 	lastFound := false
+	path := fmt.Sprintf(blobsPath, reference.Path(s.physicalRef.ref), info.Digest.String())
 	for _, c := range chunks {
 		if lastFound {
 			return nil, nil, fmt.Errorf("internal error: another chunk requested after an util-EOF chunk")
@@ -395,8 +396,10 @@ func (s *dockerImageSource) GetBlobAt(ctx context.Context, info types.BlobInfo, 
 		// If the Length is set to -1, then request anything after the specified offset.
 		if c.Length == math.MaxUint64 {
 			lastFound = true
+			logrus.Debugf("GetBlobAt path %s adding range %d till end", path, c.Offset)
 			rangeVals = append(rangeVals, fmt.Sprintf("%d-", c.Offset))
 		} else {
+			logrus.Debugf("GetBlobAt path %s adding range %d - %d", path, c.Offset, c.Offset+c.Length-1)
 			rangeVals = append(rangeVals, fmt.Sprintf("%d-%d", c.Offset, c.Offset+c.Length-1))
 		}
 	}
@@ -410,8 +413,7 @@ func (s *dockerImageSource) GetBlobAt(ctx context.Context, info types.BlobInfo, 
 	if err := info.Digest.Validate(); err != nil { // Make sure info.Digest.String() does not contain any unexpected characters
 		return nil, nil, err
 	}
-	path := fmt.Sprintf(blobsPath, reference.Path(s.physicalRef.ref), info.Digest.String())
-	logrus.Debugf("Downloading %s", path)
+	logrus.Debugf("Downloading %s headers %s", path, strings.Join(headers["Range"], ";"))
 	res, err := s.c.makeRequest(ctx, http.MethodGet, path, headers, nil, v2Auth, nil)
 	if err != nil {
 		return nil, nil, err
@@ -423,6 +425,7 @@ func (s *dockerImageSource) GetBlobAt(ctx context.Context, info types.BlobInfo, 
 		// streams as it would have been done with 206.
 		streams := make(chan io.ReadCloser)
 		errs := make(chan error)
+		logrus.Debugf("Got HTTP 200 response for %s", path)
 		go splitHTTP200ResponseToPartial(streams, errs, res.Body, chunks)
 		return streams, errs, nil
 	case http.StatusPartialContent:
@@ -434,6 +437,7 @@ func (s *dockerImageSource) GetBlobAt(ctx context.Context, info types.BlobInfo, 
 		streams := make(chan io.ReadCloser)
 		errs := make(chan error)
 
+		logrus.Debugf("Got HTTP 206 response for %s", path)
 		go handle206Response(streams, errs, res.Body, chunks, mediaType, params)
 		return streams, errs, nil
 	case http.StatusBadRequest:

@@ -35,6 +35,8 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -209,7 +211,9 @@ func (s *storageImageDestination) computeNextBlobCacheFile() string {
 // to any other readers for download using the supplied digest.
 // If stream.Read() at any time, ESPECIALLY at end of input, returns an error, PutBlob MUST 1) fail, and 2) delete any data stored so far.
 func (s *storageImageDestination) PutBlobWithOptions(ctx context.Context, stream io.Reader, blobinfo types.BlobInfo, options private.PutBlobOptions) (private.UploadedBlob, error) {
+	_, childSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "PutBlobWithOptions putBlobToPendingFile", trace.WithAttributes(attribute.String("digest", string(blobinfo.Digest))))
 	info, err := s.putBlobToPendingFile(stream, blobinfo, &options)
+	childSpan.End()
 	if err != nil {
 		return info, err
 	}
@@ -218,7 +222,10 @@ func (s *storageImageDestination) PutBlobWithOptions(ctx context.Context, stream
 		return info, nil
 	}
 
-	return info, s.queueOrCommit(*options.LayerIndex, addedLayerInfo{
+	ctx, childSpan = trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "PutBlobWithOptions queueOrCommit", trace.WithAttributes(attribute.String("digest", string(info.Digest)), attribute.Int("layerIndex", *options.LayerIndex)))
+	defer childSpan.End()
+
+	return info, s.queueOrCommit(ctx, *options.LayerIndex, addedLayerInfo{
 		digest:     info.Digest,
 		emptyLayer: options.EmptyLayer,
 	})
@@ -315,6 +322,11 @@ func (f *zstdFetcher) GetBlobAt(chunks []chunked.ImageSourceChunk) (chan io.Read
 // If the call fails with ErrFallbackToOrdinaryLayerDownload, the caller can fall back to PutBlobWithOptions.
 // The fallback _must not_ be done otherwise.
 func (s *storageImageDestination) PutBlobPartial(ctx context.Context, chunkAccessor private.BlobChunkAccessor, srcInfo types.BlobInfo, options private.PutBlobPartialOptions) (_ private.UploadedBlob, retErr error) {
+	ctx, childSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(
+		ctx, "PutBlobPartial",
+		trace.WithAttributes(attribute.String("digest", string(srcInfo.Digest))))
+	defer childSpan.End()
+
 	fetcher := zstdFetcher{
 		chunkAccessor: chunkAccessor,
 		ctx:           ctx,
@@ -332,8 +344,10 @@ func (s *storageImageDestination) PutBlobPartial(ctx context.Context, chunkAcces
 	if err != nil {
 		return private.UploadedBlob{}, err
 	}
+	childSpan.AddEvent("got differ")
 
 	out, err := s.imageRef.transport.store.PrepareStagedLayer(nil, differ)
+	childSpan.AddEvent("prepared staged layer")
 	if err != nil {
 		return private.UploadedBlob{}, fmt.Errorf("staging a partially-pulled layer: %w", err)
 	}
@@ -397,12 +411,17 @@ func (s *storageImageDestination) TryReusingBlobWithOptions(ctx context.Context,
 	if !impl.OriginalCandidateMatchesTryReusingBlobOptions(options) {
 		return false, private.ReusedBlob{}, nil
 	}
+	_, childSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "TryReusingBlobWithOptions putBlobToPendingFile", trace.WithAttributes(attribute.String("digest", string(blobinfo.Digest))))
 	reused, info, err := s.tryReusingBlobAsPending(blobinfo.Digest, blobinfo.Size, &options)
+	childSpan.End()
 	if err != nil || !reused || options.LayerIndex == nil {
 		return reused, info, err
 	}
 
-	return reused, info, s.queueOrCommit(*options.LayerIndex, addedLayerInfo{
+	ctx, childSpan = trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "TryReusingBlobWithOptions queueOrCommit", trace.WithAttributes(attribute.String("digest", string(info.Digest))))
+	defer childSpan.End()
+
+	return reused, info, s.queueOrCommit(ctx, *options.LayerIndex, addedLayerInfo{
 		digest:     info.Digest,
 		emptyLayer: options.EmptyLayer,
 	})
@@ -735,7 +754,7 @@ func (s *storageImageDestination) getConfigBlob(info types.BlobInfo) ([]byte, er
 // queueOrCommit queues the specified layer to be committed to the storage.
 // If no other goroutine is already committing layers, the layer and all
 // subsequent layers (if already queued) will be committed to the storage.
-func (s *storageImageDestination) queueOrCommit(index int, info addedLayerInfo) error {
+func (s *storageImageDestination) queueOrCommit(ctx context.Context, index int, info addedLayerInfo) error {
 	// NOTE: whenever the code below is touched, make sure that all code
 	// paths unlock the lock and to unlock it exactly once.
 	//
@@ -771,7 +790,7 @@ func (s *storageImageDestination) queueOrCommit(index int, info addedLayerInfo) 
 		}
 		s.lock.Unlock()
 		// Note: commitLayer locks on-demand.
-		if stopQueue, err := s.commitLayer(index, info, -1); stopQueue || err != nil {
+		if stopQueue, err := s.commitLayer(ctx, index, info, -1); stopQueue || err != nil {
 			return err
 		}
 		s.lock.Lock()
@@ -812,7 +831,10 @@ func (s *storageImageDestination) singleLayerIDComponent(layerIndex int, blobDig
 // Caution: this function must be called without holding `s.lock`.  Callers
 // must guarantee that, at any given time, at most one goroutine may execute
 // `commitLayer()`.
-func (s *storageImageDestination) commitLayer(index int, info addedLayerInfo, size int64) (bool, error) {
+func (s *storageImageDestination) commitLayer(ctx context.Context, index int, info addedLayerInfo, size int64) (bool, error) {
+	ctx, childSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "commitLayer", trace.WithAttributes(attribute.String("digest", string(info.digest)), attribute.Int("layerIndex", index), attribute.Int64("size", size)))
+	defer childSpan.End()
+
 	// Already committed?  Return early.
 	if _, alreadyCommitted := s.indexToStorageID[index]; alreadyCommitted {
 		return false, nil
@@ -878,10 +900,13 @@ func (s *storageImageDestination) commitLayer(index int, info addedLayerInfo, si
 	if layer, err2 := s.imageRef.transport.store.Layer(id); layer != nil && err2 == nil {
 		// There's already a layer that should have the right contents, just reuse it.
 		s.indexToStorageID[index] = layer.ID
+		childSpan.SetAttributes(
+			attribute.String("reusedLayerId", id),
+		)
 		return false, nil
 	}
 
-	layer, err := s.createNewLayer(index, info.digest, parentLayer, id)
+	layer, err := s.createNewLayer(ctx, index, info.digest, parentLayer, id)
 	if err != nil {
 		return false, err
 	}
@@ -894,11 +919,15 @@ func (s *storageImageDestination) commitLayer(index int, info addedLayerInfo, si
 
 // createNewLayer creates a new layer newLayerID for (index, layerDigest) on top of parentLayer (which may be "").
 // If the layer cannot be committed yet, the function returns (nil, nil).
-func (s *storageImageDestination) createNewLayer(index int, layerDigest digest.Digest, parentLayer, newLayerID string) (*storage.Layer, error) {
+func (s *storageImageDestination) createNewLayer(ctx context.Context, index int, layerDigest digest.Digest, parentLayer, newLayerID string) (*storage.Layer, error) {
+	span := trace.SpanFromContext(ctx)
 	s.lock.Lock()
 	diffOutput, ok := s.lockProtected.diffOutputs[index]
 	s.lock.Unlock()
 	if ok {
+		span.SetAttributes(
+			attribute.Int("knownDiffOutput index", index),
+		)
 		// If we know a trusted DiffID value (e.g. from a BlobInfoCache), set it in diffOutput.
 		// That way it will be persisted in storage even if the cache is deleted; also
 		// we can use the value below to avoid the untrustedUncompressedDigest logic (and notably
@@ -943,6 +972,13 @@ func (s *storageImageDestination) createNewLayer(index int, layerDigest digest.D
 				Flags: flags,
 			},
 		}
+
+		_, childSpan := span.TracerProvider().Tracer("code-exec-service").Start(ctx, "createNewLayer ApplyStagedLayer", trace.WithAttributes(
+			attribute.String("id", newLayerID),
+			attribute.String("parent", parentLayer),
+		))
+		defer childSpan.End()
+
 		layer, err := s.imageRef.transport.store.ApplyStagedLayer(args)
 		if err != nil && !errors.Is(err, storage.ErrDuplicateID) {
 			return nil, fmt.Errorf("failed to put layer using a partial pull: %w", err)
@@ -983,16 +1019,25 @@ func (s *storageImageDestination) createNewLayer(index int, layerDigest digest.D
 		var layer *storage.Layer // = nil
 		if trusted.diffID != "" {
 			if layers, err2 := s.imageRef.transport.store.LayersByUncompressedDigest(trusted.diffID); err2 == nil && len(layers) > 0 {
+				span.SetAttributes(
+					attribute.String("found LayersByUncompressedDigest diffID", string(trusted.diffID)),
+				)
 				layer = &layers[0]
 			}
 		}
 		if layer == nil && trusted.tocDigest != "" {
 			if layers, err2 := s.imageRef.transport.store.LayersByTOCDigest(trusted.tocDigest); err2 == nil && len(layers) > 0 {
+				span.SetAttributes(
+					attribute.String("found LayersByTOCDigest diffID", string(trusted.tocDigest)),
+				)
 				layer = &layers[0]
 			}
 		}
 		if layer == nil && trusted.blobDigest != "" {
 			if layers, err2 := s.imageRef.transport.store.LayersByCompressedDigest(trusted.blobDigest); err2 == nil && len(layers) > 0 {
+				span.SetAttributes(
+					attribute.String("found LayersByCompressedDigest diffID", string(trusted.blobDigest)),
+				)
 				layer = &layers[0]
 			}
 		}
@@ -1005,10 +1050,15 @@ func (s *storageImageDestination) createNewLayer(index int, layerDigest digest.D
 		diffOptions := &storage.DiffOptions{
 			Compression: &noCompression,
 		}
+		_, childSpan := span.TracerProvider().Tracer("code-exec-service").Start(ctx, "createNewLayer Diff", trace.WithAttributes(
+			attribute.String("id", layer.ID),
+		))
 		diff, err2 := s.imageRef.transport.store.Diff("", layer.ID, diffOptions)
 		if err2 != nil {
+			childSpan.End()
 			return nil, fmt.Errorf("reading layer %q for blob %q/%q/%q: %w", layer.ID, trusted.blobDigest, trusted.tocDigest, trusted.diffID, err2)
 		}
+		childSpan.End()
 		// Copy the layer diff to a file.  Diff() takes a lock that it holds
 		// until the ReadCloser that it returns is closed, and PutLayer() wants
 		// the same lock, so the diff can't just be directly streamed from one
@@ -1022,7 +1072,12 @@ func (s *storageImageDestination) createNewLayer(index int, layerDigest digest.D
 		// Copy the data to the file.
 		// TODO: This can take quite some time, and should ideally be cancellable using
 		// ctx.Done().
+		_, childSpan = span.TracerProvider().Tracer("code-exec-service").Start(ctx, "createNewLayer Copy", trace.WithAttributes(
+			attribute.String("id", layer.ID),
+			attribute.String("filename", filename),
+		))
 		fileSize, err := io.Copy(file, diff)
+		childSpan.End()
 		diff.Close()
 		file.Close()
 		if err != nil {
@@ -1063,6 +1118,13 @@ func (s *storageImageDestination) createNewLayer(index int, layerDigest digest.D
 		return nil, fmt.Errorf("opening file %q: %w", filename, err)
 	}
 	defer file.Close()
+	_, childSpan := span.TracerProvider().Tracer("code-exec-service").Start(ctx, "createNewLayer PutLayer", trace.WithAttributes(
+		attribute.String("id", newLayerID),
+		attribute.String("parentLayer", parentLayer),
+		attribute.String("trustedOriginalDigest", string(trustedOriginalDigest)),
+		attribute.String("trusted.diffID", string(trusted.diffID)),
+	))
+	defer childSpan.End()
 	// Build the new layer using the diff, regardless of where it came from.
 	// TODO: This can take quite some time, and should ideally be cancellable using ctx.Done().
 	layer, _, err := s.imageRef.transport.store.PutLayer(newLayerID, parentLayer, nil, "", false, &storage.LayerOptions{
@@ -1129,6 +1191,8 @@ func (s *storageImageDestination) untrustedLayerDiffID(layerIndex int) (digest.D
 // - Uploaded data MAY be visible to others before CommitWithOptions() is called
 // - Uploaded data MAY be removed or MAY remain around if Close() is called without CommitWithOptions() (i.e. rollback is allowed but not guaranteed)
 func (s *storageImageDestination) CommitWithOptions(ctx context.Context, options private.CommitOptions) error {
+	ctx, childSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(ctx, "CommitWithOptions")
+	defer childSpan.End()
 	// This function is outside of the scope of HasThreadSafePutBlob, so we don’t need to hold s.lock.
 
 	if len(s.manifest) == 0 {
@@ -1167,7 +1231,7 @@ func (s *storageImageDestination) CommitWithOptions(ctx context.Context, options
 
 	// Extract, commit, or find the layers.
 	for i, blob := range layerBlobs {
-		if stopQueue, err := s.commitLayer(i, addedLayerInfo{
+		if stopQueue, err := s.commitLayer(ctx, i, addedLayerInfo{
 			digest:     blob.Digest,
 			emptyLayer: blob.EmptyLayer,
 		}, blob.Size); err != nil {

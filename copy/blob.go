@@ -10,6 +10,8 @@ import (
 	compressiontypes "github.com/containers/image/v5/pkg/compression/types"
 	"github.com/containers/image/v5/types"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // copyBlobFromStream copies a blob with srcInfo (with known Digest and Annotations and possibly known Size) from srcReader to dest,
@@ -58,6 +60,9 @@ func (ic *imageCopier) copyBlobFromStream(ctx context.Context, srcReader io.Read
 	// === Send a copy of the original, uncompressed, stream, to a separate path if necessary.
 	var originalLayerReader io.Reader // DO NOT USE this other than to drain the input if no other consumer in the pipeline has done so.
 	if getOriginalLayerCopyWriter != nil {
+		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.Bool("hasCopyWriter", true),
+		)
 		stream.reader = io.TeeReader(stream.reader, getOriginalLayerCopyWriter(detectedCompression.decompressor))
 		originalLayerReader = stream.reader
 	}
@@ -108,6 +113,7 @@ func (ic *imageCopier) copyBlobFromStream(ctx context.Context, srcReader io.Read
 	if err != nil {
 		return types.BlobInfo{}, fmt.Errorf("writing blob: %w", err)
 	}
+
 	uploadedInfo := updatedBlobInfoFromUpload(stream.info, destBlob)
 
 	compressionStep.updateCompressionEdits(&uploadedInfo.CompressionOperation, &uploadedInfo.CompressionAlgorithm, &uploadedInfo.Annotations)
@@ -122,6 +128,9 @@ func (ic *imageCopier) copyBlobFromStream(ctx context.Context, srcReader io.Read
 	// sent there if we are not already at EOF.
 	if getOriginalLayerCopyWriter != nil {
 		logrus.Debugf("Consuming rest of the original blob to satisfy getOriginalLayerCopyWriter")
+		trace.SpanFromContext(ctx).SetAttributes(
+			attribute.Int64("barBeforeDiscard", bar.Current()),
+		)
 		_, err := io.Copy(io.Discard, originalLayerReader)
 		if err != nil {
 			return types.BlobInfo{}, fmt.Errorf("reading input blob %s: %w", srcInfo.Digest, err)
