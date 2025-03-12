@@ -27,6 +27,7 @@ import (
 	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/vbauerster/mpb/v8"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -692,6 +693,14 @@ func compressionEditsFromBlobInfo(srcInfo types.BlobInfo) (types.LayerCompressio
 // and returns a complete blobInfo of the copied layer, and a value for LayerDiffIDs if diffIDIsNeeded
 // srcRef can be used as an additional hint to the destination during checking whether a layer can be reused but srcRef can be nil.
 func (ic *imageCopier) copyLayer(ctx context.Context, srcInfo types.BlobInfo, toEncrypt bool, pool *mpb.Progress, layerIndex int, srcRef reference.Named, emptyLayer bool) (types.BlobInfo, digest.Digest, error) {
+	ctx, childSpan := trace.SpanFromContext(ctx).TracerProvider().Tracer("code-exec-service").Start(
+		ctx, "copyLayer",
+		trace.WithAttributes(
+			attribute.String("srcInfo.digest", string(srcInfo.Digest)),
+			attribute.Int64("srcInfo.Size", srcInfo.Size),
+		))
+	defer childSpan.End()
+
 	// If the srcInfo doesn't contain compression information, try to compute it from the
 	// MediaType, which was either read from a manifest by way of LayerInfos() or constructed
 	// by LayerInfosForCopy(), if it was supplied at all.  If we succeed in copying the blob,
@@ -785,6 +794,11 @@ func (ic *imageCopier) copyLayer(ctx context.Context, srcInfo types.BlobInfo, to
 				}
 			}
 
+			childSpan.SetAttributes(
+				attribute.Bool("reused", true),
+				attribute.Int64("reusedBlob.Size", reusedBlob.Size),
+			)
+
 			return updatedBlobInfoFromReuse(srcInfo, reusedBlob), cachedDiffID, nil
 		}
 	}
@@ -835,6 +849,9 @@ func (ic *imageCopier) copyLayer(ctx context.Context, srcInfo types.BlobInfo, to
 			return types.BlobInfo{}, "", fmt.Errorf("partial pull of blob %s: %w", srcInfo.Digest, err)
 		}
 		if reused {
+			childSpan.SetAttributes(
+				attribute.Bool("PartialPut", true),
+			)
 			return blobInfo, cachedDiffID, nil
 		}
 	}
@@ -848,6 +865,10 @@ func (ic *imageCopier) copyLayer(ctx context.Context, srcInfo types.BlobInfo, to
 		defer bar.Abort(false)
 
 		srcStream, srcBlobSize, err := ic.c.rawSource.GetBlob(ctx, srcInfo, ic.c.blobInfoCache)
+		childSpan.SetAttributes(
+			attribute.Bool("fallback", true),
+			attribute.Int64("srcBlobSize", srcBlobSize),
+		)
 		if err != nil {
 			return types.BlobInfo{}, "", fmt.Errorf("reading blob %s: %w", srcInfo.Digest, err)
 		}
