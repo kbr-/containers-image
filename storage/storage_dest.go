@@ -344,8 +344,10 @@ func (s *storageImageDestination) PutBlobPartial(ctx context.Context, chunkAcces
 	if err != nil {
 		return private.UploadedBlob{}, err
 	}
+	childSpan.AddEvent("got differ")
 
 	out, err := s.imageRef.transport.store.PrepareStagedLayer(nil, differ)
+	childSpan.AddEvent("prepared staged layer")
 	if err != nil {
 		return private.UploadedBlob{}, fmt.Errorf("staging a partially-pulled layer: %w", err)
 	}
