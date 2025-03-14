@@ -147,3 +147,6 @@ require (
 	google.golang.org/protobuf v1.34.2 // indirect
 	gotest.tools/v3 v3.5.1 // indirect
 )
+
+
+replace github.com/containers/storage => /home/kbr/dev/containers/storage
